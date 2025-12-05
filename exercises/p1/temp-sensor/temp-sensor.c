@@ -1,6 +1,6 @@
 /**
  * \file
- *         Práctica 1, ejercicio 2. Hello world modificado.
+ *         Práctica 1, ejercicio 4. Medida de la temperatura interna.
  * \author
  *         Rafael Muñoz Borrego
  *         Francisco José Rodríguez López  
@@ -51,7 +51,6 @@ PROCESS_THREAD(temp_process, ev, data)
   float temp_celsius = 0;
   int   temp_integer = 0;
   int   temp_decimal = 0;
-
 
   PROCESS_BEGIN();
 
