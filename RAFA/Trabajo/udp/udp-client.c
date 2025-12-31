@@ -1,144 +1,164 @@
 #include "contiki.h"
 #include "net/routing/routing.h"
-#include "random.h"
-#include "net/netstack.h"
 #include "net/ipv6/simple-udp.h"
+#include "dev/leds.h"
+#include "dev/button-hal.h"
+#include "temperature-sensor.h" // Asegúrate de que este es tu driver
 #include <stdint.h>
-#include <inttypes.h>
 
-
-#include "sys/log.h"
-#define LOG_MODULE "App"
-#define LOG_LEVEL LOG_LEVEL_INFO
+/* --- CONFIGURACIÓN DE TIEMPOS --- */
+#define SEND_INTERVAL      (5 * CLOCK_SECOND) // Enviar cada 5s 
+#define MEASURE_INTERVAL   (1 * CLOCK_SECOND) // Medir cada 1s (respuesta rápida alarma)
+#define BLINK_INTERVAL     (CLOCK_SECOND / 2) // Parpadeo 0.5s 
 
 #define UDP_CLIENT_PORT    8765
 #define UDP_SERVER_PORT    5678
-#define SEND_INTERVAL      (10 * CLOCK_SECOND)
+#define NODE_ID            0xAA  // Tu ID asignado
 
-/* Temperature sensor */
-//#include "dev/temperature-sensor.h"
-#include "temperature-sensor.h"
+/* --- VARIABLES COMPARTIDAS (Globales) --- */
+/* Estas variables sirven de puente entre los hilos */
+static volatile float current_temp_celsius = 0.0f;
+static volatile uint8_t is_alarm_active = 0;   // 0 = OK, 1 = Alarma
+static volatile uint8_t unit_mode = 0;         // 0 = Celsius (0x1), 1 = Fahrenheit (0x2)
 
-//#include "dev/sensor.h"
+/* --- DECLARACIÓN DE PROCESOS --- */
+PROCESS(measurement_process, "Sensor Measurement Process");
+PROCESS(alarm_led_process, "Alarm LED Process");
+PROCESS(udp_send_process, "UDP Communication Process");
 
-/* Button */
-#include "dev/button-hal.h"
+// Arrancamos los 3 procesos automáticamente
+AUTOSTART_PROCESSES(&measurement_process, &alarm_led_process, &udp_send_process);
 
-static struct simple_udp_connection udp_conn;
-static uint32_t rx_count = 0;
-
-/* Mode: 0 = Celsius, 1 = Fahrenheit */
-static uint8_t temperature_mode = 0;
-
-/* Node ID */
-#define NODE_ID 0xAA
-
-/*---------------------------------------------------------------------------*/
-PROCESS(udp_client_process, "UDP client");
-AUTOSTART_PROCESSES(&udp_client_process);
-/*---------------------------------------------------------------------------*/
-
-static void
-udp_rx_callback(struct simple_udp_connection *c,
-                const uip_ipaddr_t *sender_addr,
-                uint16_t sender_port,
-                const uip_ipaddr_t *receiver_addr,
-                uint16_t receiver_port,
-                const uint8_t *data,
-                uint16_t datalen)
+/* -------------------------------------------------------------------------- */
+/* HILO 1: MEDICIÓN Y LÓGICA DE ALARMA (Productor)                            */
+/* -------------------------------------------------------------------------- */
+PROCESS_THREAD(measurement_process, ev, data)
 {
-  LOG_INFO("Received response '%.*s' from ", datalen, (char *) data);
-  LOG_INFO_6ADDR(sender_addr);
-  LOG_INFO_("\n");
-  rx_count++;
+  static struct etimer measure_timer;
+  PROCESS_BEGIN();
+
+  /* Inicializar sensor */
+  SENSORS_ACTIVATE(temperature_sensor);
+  
+  etimer_set(&measure_timer, MEASURE_INTERVAL);
+
+  while(1) {
+    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&measure_timer));
+
+    /* 1. Leer sensor */
+    int raw = temperature_sensor.value(0);
+
+    float temp = (float)raw / 4.0f; // Convertir a °C según driver nRF52
+
+    /* 2. Actualizar variable global (sección crítica simplificada) */
+    current_temp_celsius = temp;
+
+    /* 3. Comprobar umbral de alarma (> 35°C) [cite: 52] */
+    if (current_temp_celsius > 35.0f) {
+        is_alarm_active = 1;
+    } else {
+        is_alarm_active = 0;
+    }
+
+    etimer_reset(&measure_timer);
+  }
+  PROCESS_END();
 }
 
-/*---------------------------------------------------------------------------*/
-PROCESS_THREAD(udp_client_process, ev, data)
+/* -------------------------------------------------------------------------- */
+/* HILO 2: INTERFAZ DE USUARIO - LED DE ALARMA (Actuador Visual)              */
+/* -------------------------------------------------------------------------- */
+PROCESS_THREAD(alarm_led_process, ev, data)
 {
-  static struct etimer periodic_timer;
-  static uint32_t tx_count = 0;
-  static uint32_t missed_tx_count = 0;
+  static struct etimer blink_timer;
+  PROCESS_BEGIN();
+
+  etimer_set(&blink_timer, BLINK_INTERVAL);
+
+  while(1) {
+    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&blink_timer));
+
+    if (is_alarm_active) {
+       /* Si hay alarma, conmutamos LED cada 0.5s  */
+       leds_toggle(LEDS_RED);
+    } else {
+       /* Si no, aseguramos que esté apagado */
+       leds_off(LEDS_RED);
+    }
+
+    etimer_reset(&blink_timer);
+  }
+  PROCESS_END();
+}
+
+/* -------------------------------------------------------------------------- */
+/* HILO 3: COMUNICACIÓN UDP (Consumidor)                                      */
+/* -------------------------------------------------------------------------- */
+PROCESS_THREAD(udp_send_process, ev, data)
+{
+  static struct etimer send_timer;
+  static struct simple_udp_connection udp_conn;
   uip_ipaddr_t dest_ipaddr;
 
   PROCESS_BEGIN();
 
-  /* Activate temperature sensor */
-  SENSORS_ACTIVATE(temperature_sensor);
-
-  /* Activate button HAL */
+  /* Inicializar botón y red */
   button_hal_init();
-
-  /* Register UDP */
   simple_udp_register(&udp_conn, UDP_CLIENT_PORT, NULL,
-                      UDP_SERVER_PORT, udp_rx_callback);
+                      UDP_SERVER_PORT, NULL);
 
-  etimer_set(&periodic_timer, random_rand() % SEND_INTERVAL);
+  etimer_set(&send_timer, SEND_INTERVAL);
 
   while(1) {
     PROCESS_WAIT_EVENT();
 
-    /* ---------------------- BUTTON HANDLING ----------------------- */
+    /* --- GESTIÓN DEL BOTÓN (Cambio de unidad) --- */
     if(ev == button_hal_press_event) {
-      temperature_mode ^= 1;  // Toggle mode
-      LOG_INFO("Mode changed: %s\n", (temperature_mode == 0) ? "Celsius" : "Fahrenheit");
+        unit_mode ^= 1; // Alternar entre 0 y 1
     }
 
-    /* ---------------------- TIMER EXPIRED ------------------------- */
-    if(ev == PROCESS_EVENT_TIMER && etimer_expired(&periodic_timer)) {
+    /* --- GESTIÓN DEL ENVÍO (Cada 5s) --- */
+    if(ev == PROCESS_EVENT_TIMER && etimer_expired(&send_timer)) {
 
-      if(NETSTACK_ROUTING.node_is_reachable() &&
-         NETSTACK_ROUTING.get_root_ipaddr(&dest_ipaddr)) {
+        if(NETSTACK_ROUTING.node_is_reachable() && 
+           NETSTACK_ROUTING.get_root_ipaddr(&dest_ipaddr)) {
 
-        /* Read raw temperature from sensor (centi-degrees) */
-        int raw_temp = temperature_sensor.value(0); // centi-degrees
-        float temp_celsius = (float)raw_temp / 100.0f;
+            /* 1. Obtener temperatura a enviar según el modo */
+            float temp_to_send;
+            if (unit_mode == 0) {
+                temp_to_send = current_temp_celsius; // Celsius
+            } else {
+                temp_to_send = (current_temp_celsius * 1.8f) + 32.0f; // Fahrenheit
+            }
 
-        /* Convert to Fahrenheit if mode = 1 */
-        float temp_to_send = (temperature_mode == 0) ? temp_celsius : (temp_celsius * 1.8f + 32.0f);
+            /* 2. Conversión a Punto Fijo F12,4 [cite: 26] */
+            // Multiplicamos por 16 (2^4) para desplazar la coma
+            int16_t temp_f12_4 = (int16_t)(temp_to_send * 16.0f);
 
-        /* ------------------- Build F12,4 temperature ------------------ */
-        // F12,4: 12 bits con signo para entero + 4 bits para decimal
-        // Multiplicamos por 16 para el formato F12,4
-        int16_t temp_f12_4 = (int16_t)(temp_to_send * 16.0f);
+            /* 3. Construcción de la Trama (8 bytes) */
+            uint8_t frame[8];
+            frame[0] = 0x55;      // Bandera 
+            frame[1] = 0x01;      // ID Trama
+            frame[2] = NODE_ID;   // ID Nodo 
+            
+            // Unidad: 0x1 (C) o 0x2 (F) 
+            frame[3] = (unit_mode == 0) ? 0x01 : 0x02; 
 
-        /* ------------------- Build binary frame ---------------------- */
-        uint8_t frame[8];
+            // Valor Temperatura (Big Endian) 
+            frame[4] = (temp_f12_4 >> 8) & 0xFF;
+            frame[5] = temp_f12_4 & 0xFF;
 
-        frame[0] = 0x55;                     // Bandera inicio
-        frame[1] = 0x01;                     // Identificador trama
-        frame[2] = NODE_ID;                   // Identificador nodo
-        frame[3] = (temperature_mode == 0) ? 0x01 : 0x02;  // Unidad
+            // Alarma (ID=1) y Estado 
+            frame[6] = 0x01; 
+            frame[7] = is_alarm_active; // 0x00 o 0x01
 
-        // Temperatura 2 bytes, big endian
-        frame[4] = (temp_f12_4 >> 8) & 0xFF; 
-        frame[5] = temp_f12_4 & 0xFF;
+            /* 4. Enviar */
+            simple_udp_sendto(&udp_conn, frame, sizeof(frame), &dest_ipaddr);
+        }
 
-        frame[6] = 0x01;                     // Tipo de alarma
-        frame[7] = 0x00;                     // Valor alarma (0x00 no activa)
-
-        /* Send frame */
-        simple_udp_sendto(&udp_conn, frame, sizeof(frame), &dest_ipaddr);
-
-        /* Logging */
-        LOG_INFO("Sent temperature %.2f (%s) -> Frame: %02X %02X %02X %02X %02X %02X %02X %02X\n",
-                 temp_to_send,
-                 (temperature_mode == 0) ? "C" : "F",
-                 frame[0], frame[1], frame[2], frame[3],
-                 frame[4], frame[5], frame[6], frame[7]);
-
-        tx_count++;
-
-      } else {
-        LOG_INFO("Not reachable yet\n");
-        if(tx_count > 0) missed_tx_count++;
-      }
-
-      /* Reset timer */
-      etimer_set(&periodic_timer, SEND_INTERVAL - CLOCK_SECOND + (random_rand() % (2 * CLOCK_SECOND)));
+        /* Reiniciar timer para el siguiente envío en 5s */
+        etimer_reset(&send_timer);
     }
   }
-
   PROCESS_END();
 }
-/*---------------------------------------------------------------------------*/
