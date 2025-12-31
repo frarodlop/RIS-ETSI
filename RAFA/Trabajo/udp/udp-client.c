@@ -3,7 +3,7 @@
 #include "net/ipv6/simple-udp.h"
 #include "dev/leds.h"
 #include "dev/button-hal.h"
-#include "temperature-sensor.h" // Asegúrate de que este es tu driver
+#include "temperature-sensor.h" 
 #include <stdint.h>
 
 /* --- CONFIGURACIÓN DE TIEMPOS --- */
